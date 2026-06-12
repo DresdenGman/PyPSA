@@ -383,6 +383,7 @@ class StatisticsAccessor(AbstractStatisticsAccessor):
         "revenue",
         "market_value",
         "prices",
+        "residual_load",
     ]
 
     def _get_component_index(self, df: pd.DataFrame | pd.Series, c: str) -> pd.Index:
@@ -2803,6 +2804,146 @@ class StatisticsAccessor(AbstractStatisticsAccessor):
         df.attrs["name"] = "Market Value"
         df.attrs["unit"] = "currency / operational unit"
         return df
+
+    @MethodHandlerWrapper(handler_class=StatisticHandler, inject_attrs={"n": "_n"})
+    def residual_load(  # noqa: D417
+        self,
+        vre_carriers: str | Sequence[str] | None = None,
+        groupby_time: str | bool = "sum",
+        groupby: str | Literal[False] = False,
+        bus_carrier: str | Sequence[str] | None = None,
+        drop_zero: bool | None = None,
+        round: int | None = None,
+    ) -> pd.Series | pd.DataFrame:
+        """Calculate the **residual load** of the network per bus.
+
+        Residual load is defined as the total load minus variable renewable
+        energy (VRE) generation on each bus. It represents the remaining
+        demand that must be met by dispatchable generation or imports.
+
+        Parameters
+        ----------
+        vre_carriers : str | Sequence[str] | None, default=None
+            Carrier name(s) of variable renewable generators to subtract
+            from the load. Examples: ``"solar"``, ``"wind"``,
+            ``["onwind", "offwind", "solar"]``.
+            If ``None``, only load is returned (no VRE deduction).
+        groupby_time : str | bool, default="sum"
+            Type of aggregation when aggregating time series. Deactivate by
+            setting to ``False``. Any pandas aggregation function can be
+            used. Note that when aggregating the time series are aggregated
+            to MWh using snapshot weightings. With ``False`` the time series
+            is in MW.
+        groupby : str | Literal[False], default=False
+            How to group the results:
+            - ``False``: Return per-bus values.
+            - ``"bus_carrier"``: Aggregate values to each bus carrier via sum.
+        bus_carrier : str | Sequence[str] | None, default=None
+            Filter to consider only buses with the given carrier(s).
+            For example ``"AC"``.
+        drop_zero : bool | None, default=None
+            Whether to drop zero values from the result. Defaults to module
+            wide option (default: True). See
+            ``pypsa.options.params.statistics.describe()`` for more
+            information.
+        round : int | None, default=None
+            Number of decimal places to round the result to. Defaults to
+            module wide option (default: 2). See
+            ``pypsa.options.params.statistics.describe()`` for more
+            information.
+
+        Returns
+        -------
+        pd.Series | pd.DataFrame
+            If ``groupby_time`` is not ``False``, a Series indexed by bus
+            (or bus carrier if ``groupby="bus_carrier"``).
+            If ``groupby_time`` is ``False``, a DataFrame with buses as
+            rows and snapshots as columns.
+            Units depend on aggregation: MWh for ``"sum"``, MW for
+            ``"mean"`` or ``False``.
+
+        Examples
+        --------
+        >>> n.statistics.residual_load(vre_carriers=["wind", "solar"])
+        bus
+        Bus1      1200.0
+        Bus2       800.0
+        dtype: float64
+
+        Get the per-bus residual load time series:
+
+        >>> n.statistics.residual_load(
+        ...     vre_carriers=["wind", "solar"], groupby_time=False
+        ... )
+        ...
+        """
+        n = self._n
+
+        if isinstance(vre_carriers, str):
+            vre_carriers = [vre_carriers]
+
+        # 1. Sum load per bus (load p may carry a negative sign)
+        load_p = n.c["Load"].dynamic.p
+        load_buses = n.c["Load"].static.bus
+        load_by_bus = load_p.abs().T.groupby(load_buses).sum().T
+
+        # 2. Sum VRE generation per bus (supply only)
+        vre_by_bus = pd.DataFrame(
+            0, index=load_by_bus.index, columns=load_by_bus.columns
+        )
+        if vre_carriers:
+            vre_mask = n.c["Generator"].static.carrier.isin(vre_carriers)
+            if vre_mask.any():
+                vre_names = n.c["Generator"].static.index[vre_mask]
+                vre_p = n.c["Generator"].dynamic.p[vre_names].clip(lower=0)
+                vre_buses = n.c["Generator"].static.bus[vre_names]
+                vre_by_bus = vre_p.T.groupby(vre_buses).sum().T
+
+        # 3. Align buses and compute residual
+        all_buses = load_by_bus.columns.union(vre_by_bus.columns)
+        load_by_bus = load_by_bus.reindex(columns=all_buses, fill_value=0.0)
+        vre_by_bus = vre_by_bus.reindex(columns=all_buses, fill_value=0.0)
+        residual = load_by_bus - vre_by_bus  # DataFrame: snapshots × buses
+
+        # 4. Filter by bus_carrier
+        if bus_carrier is not None:
+            if isinstance(bus_carrier, str):
+                bus_carrier = [bus_carrier]
+            bus_mask = n.c.buses.static.carrier.isin(bus_carrier)
+            bus_match = n.c.buses.static.index[bus_mask]
+            residual = residual.reindex(
+                columns=bus_match.intersection(residual.columns), fill_value=0.0
+            )
+
+        # 5. Aggregate over time
+        if groupby_time:
+            weights = n.snapshot_weightings.generators
+            result = self._aggregate_timeseries(residual, weights, agg=groupby_time)
+        else:
+            result = residual.T  # buses × snapshots
+
+        # 6. Group by bus_carrier
+        if groupby == "bus_carrier":
+            bus_carrier_map = n.c.buses.static.carrier.reindex(result.index)
+            result = result.groupby(bus_carrier_map).sum()
+            result.index.name = "bus_carrier"
+        elif groupby is not False:
+            msg = f"Argument `groupby` must be False or 'bus_carrier', got {groupby!r}."
+            raise ValueError(msg)
+
+        result.attrs["name"] = "Residual Load"
+        result.attrs["unit"] = (
+            "MW" if (not groupby_time or groupby_time == "mean") else "MWh"
+        )
+
+        result = self._apply_option_kwargs(
+            result,
+            drop_zero=drop_zero,
+            round=round,
+            nice_names=False,
+        )
+
+        return result
 
     @MethodHandlerWrapper(handler_class=StatisticHandler, inject_attrs={"n": "_n"})
     def prices(  # noqa: D417
